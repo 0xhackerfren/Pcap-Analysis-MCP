@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pcap-analysis-mcp"
-version = "1.0.0"
+version = "1.0.3"
 description = "POC: Network forensics MCP server for packet analysis and attack detection"
 readme = "README.md"
 license = {text = "MIT"}
@@ -50,5 +50,11 @@ Repository = "https://github.com/0xhackerfren/Pcap-Analysis-MCP"
 [project.scripts]
 pcap-analysis-mcp = "pcap_analysis_mcp.__main__:main"
 
+[tool.setuptools]
+include-package-data = true
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+pcap_analysis_mcp = ["data/*.json", "templates/*.html", "py.typed"]

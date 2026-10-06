@@ -149,12 +149,9 @@ Examples:
         
         return 0
     
-    # Default: show capabilities
-    caps = mcp.list_capabilities()
-    print(f"{mcp.name} v{mcp.version}")
-    print(f"Tools available: {caps['tool_count']}")
-    print(f"\nRun with --help for usage information")
-    print(f"Run with --server to start MCP server")
+    # 默认行为：作为 MCP 服务器运行（stdio 传输）
+    # 客户端配置 "args": ["-m", "pcap_analysis_mcp"] 无需额外参数即可启动
+    mcp.run_server()
     return 0
 
 

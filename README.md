@@ -9,7 +9,7 @@ Network forensics MCP (Model Context Protocol) server providing AI agents with p
 
 ## What It Does
 
-- **50+ Analysis Tools** across 8 categories
+- **60+ Analysis Tools** (63 total) across 8 categories
 - **Attack Detection** - CVE patterns, port scans, web exploits
 - **Timeline Reconstruction** - Cyber Kill Chain and MITRE ATT&CK mapping
 - **IoC Extraction** - IPs, domains with optional enrichment
@@ -20,7 +20,7 @@ Network forensics MCP (Model Context Protocol) server providing AI agents with p
 ## Installation
 
 ```bash
-git clone https://github.com/0xhackerfren/Pcap-Analysis-MCP.git
+git clone https://github.com/wzsx150/Pcap-Analysis-MCP.git
 cd pcap-analysis-mcp
 pip install -e .
 
@@ -52,11 +52,17 @@ Add to your MCP config:
 }
 ```
 
+> **Notes**
+> - Running without arguments starts the MCP server by default; the `--server` flag is optional (kept for compatibility).
+> - On Windows, if `python` is not in PATH, point `command` to your interpreter (e.g. `py -3.10`) or use its full absolute path.
+> - Supported MCP protocol versions: `2024-11-05`, `2025-03-26`, `2025-06-18` — negotiated automatically during `initialize`.
+
 ### Command Line
 
 ```bash
-# Run as MCP server
-python -m pcap_analysis_mcp --server
+# Run as MCP server (default behavior, no arguments needed)
+python -m pcap_analysis_mcp
+python -m pcap_analysis_mcp --server    # equivalent, kept for compatibility
 
 # Analyze a PCAP file directly
 python -m pcap_analysis_mcp --analyze capture.pcap --output report.html
@@ -88,6 +94,9 @@ mcp.generate_html_report("report.html")
 ```
 
 ## Tools
+
+### Standard MCP (3 tools)
+`list_capabilities`, `get_documentation`, `check_installation`
 
 ### Core Analysis (10 tools)
 `load_pcap`, `get_summary`, `get_conversations`, `get_protocols`, `get_statistics`, `filter_packets`, `export_packets`, `get_packet_details`, `search_payload`, `get_unique_values`
@@ -127,9 +136,9 @@ Includes patterns for:
 ```
 pcap-analysis-mcp/
   src/pcap_analysis_mcp/   # Main package
-  data/                     # Detection patterns (JSON)
-  templates/                # HTML report templates
-  examples/                 # Usage examples
+    data/                  # Detection patterns (JSON, bundled into the wheel)
+    templates/             # HTML report templates (bundled into the wheel)
+  examples/                # Usage examples
 ```
 
 ## License

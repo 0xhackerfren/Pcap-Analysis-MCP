@@ -15,10 +15,14 @@ import json
 import re
 import os
 import logging
+import inspect
+import types
+import typing
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable
 from datetime import datetime
 from collections import defaultdict
+from html import escape as escape_html
 
 from pcap_analysis_mcp.protocol import MCPProtocol
 from pcap_analysis_mcp.constants import (
@@ -28,9 +32,12 @@ from pcap_analysis_mcp.constants import (
     DEFAULT_C2_INDICATORS,
     DEFAULT_MITRE_MAPPING,
     MCP_PROTOCOL_VERSION,
+    SERVER_INSTRUCTIONS,
+    SUPPORTED_PROTOCOL_VERSIONS,
     MCP_SERVER_NAME,
     MCP_SERVER_VERSION,
     DEFAULT_PORT_SCAN_THRESHOLD,
+    DEFAULT_WEBSHELL_POST_THRESHOLD,
     DEFAULT_BEACON_INTERVAL_THRESHOLD,
     DEFAULT_EXFIL_BYTES_THRESHOLD,
     PRIVATE_IP_PREFIXES,
@@ -77,6 +84,101 @@ try:
     REQUESTS_AVAILABLE = True
 except ImportError:
     REQUESTS_AVAILABLE = False
+
+
+# =============================================================================
+# INPUT SCHEMA 生成（JSON Schema）
+# =============================================================================
+
+# Python 基础类型 -> JSON Schema 类型映射
+# 注意：bool 是 int 的子类，因此用字典按精确类型匹配，避免 bool 被误判为 integer
+_PRIMITIVE_SCHEMA_TYPES: Dict[type, str] = {
+    str: "string",
+    int: "integer",
+    float: "number",
+    bool: "boolean",
+}
+
+
+def _annotation_to_schema(annotation: Any) -> Dict[str, Any]:
+    """
+    将 Python 类型标注转换为对应的 JSON Schema 片段。
+
+    Args:
+        annotation: 函数参数的类型标注（可为 None 或 inspect.Parameter.empty）。
+
+    Returns:
+        JSON Schema 片段；无法识别时返回空 dict（表示不做类型约束，接受任意值）。
+    """
+    if annotation is None or annotation is inspect.Parameter.empty:
+        return {}
+
+    # 联合类型（Optional[X] / X | None）：剔除 None 分支后递归处理
+    origin = typing.get_origin(annotation)
+    union_type = getattr(types, "UnionType", None)  # Python 3.10+ 的 X | Y 语法
+    if origin is typing.Union or (union_type is not None and origin is union_type):
+        args = [a for a in typing.get_args(annotation) if a is not type(None)]
+        if len(args) == 1:
+            return _annotation_to_schema(args[0])
+        return {}  # 多类型联合：不做约束
+
+    if origin is list:
+        return {"type": "array", "items": {}}
+    if origin is dict:
+        return {"type": "object"}
+    if origin is tuple:
+        return {"type": "array"}
+
+    schema_type = _PRIMITIVE_SCHEMA_TYPES.get(annotation)
+    if schema_type:
+        return {"type": schema_type}
+    return {}
+
+
+def build_input_schema(func: Callable) -> Dict[str, Any]:
+    """
+    根据函数签名自动生成 MCP 规范要求的 inputSchema（JSON Schema 对象）。
+
+    MCP 规范规定 tools/list 返回的每个工具必须包含 inputSchema
+    （type 为 object 的 JSON Schema），缺失会导致客户端（基于 zod 校验的 SDK）
+    拒绝加载全部工具。
+
+    Args:
+        func: 已绑定的工具方法（绑定方法的签名会自动排除 self）。
+
+    Returns:
+        形如 {"type": "object", "properties": {...}, "required": [...]} 的 schema。
+    """
+    properties: Dict[str, Any] = {}
+    required: List[str] = []
+
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        # 无法内省签名时，返回最宽松的合法 schema
+        return {"type": "object", "properties": {}}
+
+    for param_name, param in signature.parameters.items():
+        # *args / **kwargs 不映射为 schema 属性
+        if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
+            continue
+
+        schema = _annotation_to_schema(param.annotation)
+        if not schema and param.default is not inspect.Parameter.empty and param.default is not None:
+            # 无类型标注时，尝试从默认值推断类型
+            inferred = _PRIMITIVE_SCHEMA_TYPES.get(type(param.default))
+            if inferred:
+                schema = {"type": inferred}
+
+        properties[param_name] = schema
+        # 无默认值的参数视为必填
+        if param.default is inspect.Parameter.empty:
+            required.append(param_name)
+
+    result: Dict[str, Any] = {"type": "object", "properties": properties}
+    if required:
+        result["required"] = required
+    return result
 
 
 class PCAPAnalysisMCP:
@@ -217,68 +319,171 @@ class PCAPAnalysisMCP:
     # MCP PROTOCOL METHODS
     # =========================================================================
     
-    def handle_request(self, request: Dict) -> Dict:
+    def handle_request(self, request: Dict) -> Optional[Dict]:
         """
-        Handle incoming MCP request.
-        
+        处理单条 MCP 消息（JSON-RPC 2.0）。
+
+        通知（无 id 的消息）按规范不产生任何应答，返回 None；
+        请求（id 为字符串/数字）必须返回应答字典。
+
         Args:
-            request: JSON-RPC request dict.
-            
+            request: 客户端发来的 JSON-RPC 消息。
+
         Returns:
-            JSON-RPC response dict.
+            JSON-RPC 应答字典；通知或无法处理的消息返回 None。
         """
+        if not isinstance(request, dict):
+            logger.warning(f"Ignoring non-object message: {request!r}")
+            return None
+
         method = request.get("method", "")
-        params = request.get("params", {})
         req_id = request.get("id")
-        
+        # JSON-RPC 2.0：id 为字符串/数字才是"请求"；无 id 或 id 为 null 视为通知
+        # （bool 是 int 子类，需显式排除，避免 id: true 被当成请求）
+        is_request = isinstance(req_id, (str, int, float)) and not isinstance(req_id, bool)
+
+        params = request.get("params")
+        if not isinstance(params, dict):
+            params = {}
+
+        # 所有通知（notifications/initialized、cancelled、roots/list_changed 等）
+        # 均按规范静默忽略，绝不回写任何响应（回写 id 为 null 的响应会导致客户端校验失败）
+        if not is_request:
+            if method == "notifications/initialized":
+                logger.info("Received notifications/initialized")
+            return None
+
+        # ---- 以下均为需要应答的请求 ----
         if method == "initialize":
-            return MCPProtocol.success_response(req_id, {
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "serverInfo": {"name": self.name, "version": self.version},
-                "capabilities": {"tools": {}}
-            })
-        
-        elif method == "tools/list":
-            tools = []
-            for name, func in self._tools.items():
-                tools.append({
-                    "name": name,
-                    "description": func.__doc__.split('\n')[0] if func.__doc__ else name
-                })
-            return MCPProtocol.success_response(req_id, {"tools": tools})
-        
-        elif method == "tools/call":
-            tool_name = params.get("name", "")
-            tool_args = params.get("arguments", {})
-            
-            if tool_name not in self._tools:
-                return MCPProtocol.error_response(req_id, -32601, f"Unknown tool: {tool_name}")
-            
-            try:
-                result = self._tools[tool_name](**tool_args)
-                return MCPProtocol.success_response(req_id, {
-                    "content": [{"type": "text", "text": json.dumps(result, default=str)}]
-                })
-            except Exception as e:
-                logger.exception(f"Tool {tool_name} failed")
-                return MCPProtocol.error_response(req_id, -32603, str(e))
-        
+            return self._handle_initialize(req_id, params)
+        if method == "ping":
+            return MCPProtocol.success_response(req_id, {})
+        if method == "tools/list":
+            return self._handle_tools_list(req_id)
+        if method == "tools/call":
+            return self._handle_tools_call(req_id, params)
+        if method == "resources/list":
+            # 未声明 resources 能力，但宽容返回空列表，兼容不检查 capabilities 的客户端
+            return MCPProtocol.success_response(req_id, {"resources": []})
+        if method == "prompts/list":
+            # 同上：宽容返回空 prompts 列表
+            return MCPProtocol.success_response(req_id, {"prompts": []})
+        if method == "logging/setLevel":
+            # 宽容接受日志级别设置（日志走 stderr，不影响协议流）
+            return MCPProtocol.success_response(req_id, {})
+
         return MCPProtocol.error_response(req_id, -32601, f"Unknown method: {method}")
-    
+
+    def _handle_initialize(self, req_id: Any, params: Dict) -> Dict:
+        """
+        处理 initialize 请求，进行 MCP 协议版本协商。
+
+        规范要求：客户端请求的版本受支持则原样回显，否则返回服务端支持的版本。
+        """
+        requested = params.get("protocolVersion")
+        if isinstance(requested, str) and requested in SUPPORTED_PROTOCOL_VERSIONS:
+            version = requested
+        else:
+            version = MCP_PROTOCOL_VERSION
+        return MCPProtocol.success_response(req_id, {
+            "protocolVersion": version,
+            "serverInfo": {"name": self.name, "version": self.version},
+            "capabilities": {"tools": {}},
+            "instructions": SERVER_INSTRUCTIONS,
+        })
+
+    def _handle_tools_list(self, req_id: Any) -> Dict:
+        """
+        处理 tools/list 请求。
+
+        MCP 规范要求每个工具必须包含 inputSchema（object 类型的 JSON Schema），
+        否则客户端会拒绝加载全部工具。
+        """
+        tools = []
+        for name, func in self._tools.items():
+            description = (func.__doc__ or "").strip().split('\n')[0] or name
+            tools.append({
+                "name": name,
+                "description": description,
+                "inputSchema": build_input_schema(func),
+            })
+        return MCPProtocol.success_response(req_id, {"tools": tools})
+
+    def _handle_tools_call(self, req_id: Any, params: Dict) -> Dict:
+        """
+        处理 tools/call 请求。
+
+        按 MCP 规范区分两类错误：
+        - 未知工具/参数不合法：返回 JSON-RPC 协议错误（-32602 Invalid params）；
+        - 工具执行失败：返回带 isError: true 的正常结果，便于 LLM 感知失败原因。
+        """
+        tool_name = params.get("name")
+        if not isinstance(tool_name, str) or not tool_name:
+            return MCPProtocol.error_response(req_id, -32602, "Invalid params: missing tool 'name'")
+        if tool_name not in self._tools:
+            return MCPProtocol.error_response(req_id, -32602, f"Unknown tool: {tool_name}")
+
+        tool_args = params.get("arguments")
+        if not isinstance(tool_args, dict):
+            tool_args = {}
+
+        try:
+            result = self._tools[tool_name](**tool_args)
+        except TypeError as e:
+            # 参数与工具签名不匹配 -> 协议层参数错误
+            logger.warning(f"Tool {tool_name} received invalid arguments: {e}")
+            return MCPProtocol.error_response(req_id, -32602, f"Invalid arguments for tool '{tool_name}': {e}")
+        except Exception as e:
+            # 工具执行错误：按规范以 isError 结果返回，而不是 JSON-RPC 错误
+            logger.exception(f"Tool {tool_name} failed")
+            return MCPProtocol.success_response(req_id, {
+                "content": [{"type": "text", "text": f"Tool execution failed: {e}"}],
+                "isError": True,
+            })
+
+        return MCPProtocol.success_response(req_id, {
+            "content": [{"type": "text", "text": json.dumps(result, default=str)}]
+        })
+
     def run_server(self):
         """Run MCP server loop (stdio transport)."""
+        # Windows 下 stdin/stdout 默认编码为 GBK，强制切换为 UTF-8 保证协议流正确
+        MCPProtocol.configure_streams()
         logger.info(f"Starting {self.name} v{self.version}")
-        
+
         while True:
             try:
                 request = MCPProtocol.read_message()
                 if request is None:
-                    break
-                
+                    break  # EOF：客户端已断开
+
+                # JSON-RPC 2.0 批量消息兼容：逐条处理，仅当存在应答时回写数组
+                if isinstance(request, list):
+                    responses = []
+                    for item in request:
+                        if not isinstance(item, dict):
+                            logger.warning(f"Ignoring non-object batch item: {item!r}")
+                            continue
+                        response = self.handle_request(item)
+                        if response is not None:
+                            responses.append(response)
+                    if responses:
+                        MCPProtocol.write_message(responses)
+                    continue
+
+                if not isinstance(request, dict):
+                    logger.warning(f"Ignoring non-object message: {request!r}")
+                    continue
+
+                # 通知返回 None：不写任何应答
                 response = self.handle_request(request)
-                MCPProtocol.write_message(response)
-                
+                if response is not None:
+                    MCPProtocol.write_message(response)
+
             except KeyboardInterrupt:
+                break
+            except BrokenPipeError:
+                logger.info("Client closed the connection")
                 break
             except Exception as e:
                 logger.error(f"Server error: {e}")
@@ -550,23 +755,44 @@ class PCAPAnalysisMCP:
         """Extract unique IPs, ports, or domains from PCAP."""
         if err := self._require_loaded():
             return err
-        
+
+        # 参数别名归一化：ip/ips、port/ports、domain/domains 均可；
+        # 非法取值直接报错而不是静默返回空结果
+        normalized = value_type.strip().lower()
+        if normalized not in ("all", "ip", "ips", "port", "ports", "domain", "domains"):
+            return {
+                "error": (
+                    f"Invalid value_type: '{value_type}'. "
+                    "Valid values: all, ips, ports, domains"
+                )
+            }
+
         result = {}
-        if value_type in ["all", "ips"]:
+        if normalized in ("all", "ip", "ips"):
             ips = set()
             for pkt in self.packets:
                 if IP in pkt:
                     ips.update([pkt[IP].src, pkt[IP].dst])
             result["ips"] = sorted(list(ips))
-        
-        if value_type in ["all", "domains"]:
+
+        if normalized in ("all", "port", "ports"):
+            # 端口取值：收集 TCP/UDP 的源端口与目的端口
+            ports = set()
+            for pkt in self.packets:
+                if TCP in pkt:
+                    ports.update([pkt[TCP].sport, pkt[TCP].dport])
+                elif UDP in pkt:
+                    ports.update([pkt[UDP].sport, pkt[UDP].dport])
+            result["ports"] = sorted(list(ports))
+
+        if normalized in ("all", "domain", "domains"):
             domains = set()
             for pkt in self.packets:
                 if DNS in pkt and DNSQR in pkt:
                     q = pkt[DNSQR].qname
                     domains.add((q.decode() if isinstance(q, bytes) else q).rstrip('.'))
             result["domains"] = sorted(list(domains))
-        
+
         return result
     
     # =========================================================================
@@ -817,8 +1043,73 @@ class PCAPAnalysisMCP:
         return {"transfers": transfers}
     
     def detect_webshells(self) -> Dict[str, Any]:
-        """Detect webshell indicators in traffic."""
-        return self.search_payload(r'(c99|r57|cmd\.php\?|eval\s*\(\s*\$_)')
+        """Detect webshell indicators (Godzilla, China Chopper, classic PHP shells)."""
+        if err := self._require_loaded():
+            return err
+
+        # WebShell 家族特征集：经典 PHP 一句话、命令执行函数、
+        # 哥斯拉（pass=/key=）、中国菜刀（cmd/z0）等管理端常用参数
+        signatures = {
+            "classic_eval": rb'eval\s*\(\s*(?:base64_decode\s*\(\s*)?\$_(?:POST|GET|REQUEST|COOKIE)',
+            "classic_assert": rb'assert\s*\(\s*\$_(?:POST|GET|REQUEST|COOKIE)',
+            "shell_names": rb'\b(?:c99|r57|wso|b374k|cmd\.php)\b',
+            "cmd_exec": rb'(?:shell_exec|passthru|proc_open|popen|system)\s*\(',
+            "godzilla_params": rb'(?:^|[\s?&])(?:pass|key)=',
+            "chopper_params": rb'(?:^|[\s?&])(?:cmd|command|z0|z1)=',
+        }
+        compiled = {name: re.compile(p, re.IGNORECASE | re.MULTILINE)
+                    for name, p in signatures.items()}
+
+        sig_counts = {name: 0 for name in signatures}
+        results = []
+        for i, pkt in enumerate(self.packets):
+            if Raw not in pkt:
+                continue
+            payload = bytes(pkt[Raw].load)
+            for name, regex in compiled.items():
+                m = regex.search(payload)
+                if m:
+                    sig_counts[name] += 1
+                    # 保留命中点前后各 40 字节的上下文片段，便于人工研判
+                    start = max(0, m.start() - 40)
+                    snippet = payload[start:m.end() + 40].decode('utf-8', errors='replace')
+                    results.append({
+                        "index": i,
+                        "src": pkt[IP].src if IP in pkt else None,
+                        "dst": pkt[IP].dst if IP in pkt else None,
+                        "signature": name,
+                        "match": m.group(0).decode('utf-8', errors='replace'),
+                        "snippet": snippet,
+                    })
+
+        # 结构性启发：同一 .php 端点被反复 POST，是哥斯拉/冰蝎等
+        # 加密 WebShell 的典型行为特征（无明文特征可匹配时的兜底检测）
+        post_counts = defaultdict(int)
+        for pkt in self.packets:
+            if TCP in pkt and Raw in pkt:
+                payload = bytes(pkt[Raw].load)
+                if payload.startswith(b'POST '):
+                    try:
+                        uri = payload.split(b' ', 2)[1].decode('utf-8', errors='replace')
+                        path = uri.split('?')[0]
+                        if path.endswith('.php'):
+                            post_counts[path] += 1
+                    except (IndexError, ValueError):
+                        continue
+        suspicious_endpoints = [
+            {"uri": uri, "post_count": count}
+            for uri, count in sorted(post_counts.items(), key=lambda x: -x[1])
+            if count >= DEFAULT_WEBSHELL_POST_THRESHOLD
+        ]
+
+        webshell_suspected = any(v > 0 for v in sig_counts.values()) or bool(suspicious_endpoints)
+        return {
+            "webshell_suspected": webshell_suspected,
+            "signatures_matched": {k: v for k, v in sig_counts.items() if v > 0},
+            "matches": len(results),
+            "results": results[:50],
+            "suspicious_endpoints": suspicious_endpoints[:20],
+        }
     
     def get_user_agents(self) -> Dict[str, Any]:
         """Get unique User-Agent strings."""
@@ -1222,13 +1513,18 @@ class PCAPAnalysisMCP:
             return err
         
         try:
+            template = None
+            # 优先使用外部模板目录中的 report_base.html；模板缺失或加载失败时回退到内置模板
             if TEMPLATES_DIR.exists():
-                env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)))
-                template = env.get_template("report_base.html")
-            else:
-                template_str = self._get_embedded_template()
+                try:
+                    fs_env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)))
+                    template = fs_env.get_template("report_base.html")
+                except Exception:
+                    logger.warning("report_base.html not found or failed to load, using embedded template")
+                    template = None
+            if template is None:
                 env = Environment(loader=BaseLoader())
-                template = env.from_string(template_str)
+                template = env.from_string(self._get_embedded_template())
             
             data = {
                 "title": f"PCAP Analysis: {self.pcap_metadata.get('filename', 'Unknown')}",
@@ -1293,16 +1589,87 @@ th { color: #9FEF00; }
             "severity": "critical" if exploits.get("exploits_detected", 0) > 0 else "info"
         }
     
+    def _write_html_report(self, output_path: str, title: str, body_html: str) -> Dict[str, Any]:
+        """将 HTML 内容写入报告文件，供 timeline / IoC 报告共用（纯 stdlib，不依赖 jinja2）。"""
+        html_doc = (
+            "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n"
+            f"<title>{escape_html(title)}</title>\n<style>\n"
+            "body { font-family: monospace; background: #0a0f1a; color: #e2e8f0; padding: 20px; }\n"
+            "h1, h2 { color: #9FEF00; }\n"
+            "table { border-collapse: collapse; width: 100%; margin: 10px 0; }\n"
+            "th, td { border: 1px solid #2d3a4f; padding: 6px 10px; text-align: left; }\n"
+            "th { background: #1a2332; color: #9FEF00; }\n"
+            ".meta { color: #7a8699; }\n"
+            ".defanged { background: #1a2332; padding: 10px; border-radius: 6px; word-break: break-all; }\n"
+            "</style>\n</head>\n<body>\n"
+            f"<h1>{escape_html(title)}</h1>\n"
+            f"<p class='meta'>PCAP: {escape_html(self.pcap_metadata.get('filename', 'Unknown'))} — "
+            f"generated {datetime.now().isoformat()}</p>\n"
+            f"{body_html}\n</body>\n</html>\n"
+        )
+        Path(output_path).write_text(html_doc, encoding='utf-8')
+        return {"success": True, "path": output_path}
+
     def generate_timeline_html(self, output_path: str = "timeline.html") -> Dict[str, Any]:
-        """Generate timeline visualization data."""
+        """Generate attack timeline HTML report file."""
+        if err := self._require_loaded():
+            return err
+
         timeline = self.build_attack_timeline()
-        return {"events": timeline.get("events", []), "path": output_path}
-    
+        events = timeline.get("events", [])
+        try:
+            # 每个事件渲染为表格行：阶段 / 类型 / 来源 / 严重程度
+            rows = [
+                "<tr>"
+                f"<td>{escape_html(str(e.get('phase', '')))}</td>"
+                f"<td>{escape_html(str(e.get('type', '')))}</td>"
+                f"<td>{escape_html(str(e.get('source') or ''))}</td>"
+                f"<td>{escape_html(str(e.get('severity', 'info')))}</td>"
+                "</tr>"
+                for e in events
+            ]
+            body = (
+                f"<h2>Timeline Events ({len(events)})</h2>\n"
+                "<table>\n<tr><th>Phase</th><th>Type</th><th>Source</th><th>Severity</th></tr>\n"
+                + "\n".join(rows)
+                + "\n</table>\n"
+            )
+            result = self._write_html_report(output_path, "Attack Timeline Report", body)
+            result.update({"total_events": len(events), "phases": timeline.get("phases", [])})
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+
     def generate_ioc_report(self, output_path: str = "iocs.html") -> Dict[str, Any]:
-        """Generate IoC-focused report data."""
-        iocs = self.extract_all_iocs()
-        defanged = self.defang_iocs()
-        return {"iocs": iocs, "defanged": defanged, "path": output_path}
+        """Generate IoC-focused HTML report file."""
+        if err := self._require_loaded():
+            return err
+
+        try:
+            iocs = self.extract_all_iocs()
+            defanged = self.defang_iocs()
+            ips = iocs.get("ips", [])
+            domains = iocs.get("domains", [])
+            def_ips = defanged.get("ips", [])
+            def_domains = defanged.get("domains", [])
+
+            # 渲染 IP / 域名表格与去武器化 IoC 明细
+            def _rows(values):
+                return "\n".join(f"<tr><td>{escape_html(str(v))}</td></tr>" for v in values)
+
+            body = (
+                f"<h2>IP Addresses ({len(ips)})</h2>\n"
+                "<table>\n<tr><th>IP</th></tr>\n" + _rows(ips) + "\n</table>\n"
+                f"<h2>Domains ({len(domains)})</h2>\n"
+                "<table>\n<tr><th>Domain</th></tr>\n" + _rows(domains) + "\n</table>\n"
+                "<h2>Defanged IoCs (safe for sharing)</h2>\n"
+                f"<p class='defanged'>{escape_html(' ; '.join(def_ips + def_domains))}</p>\n"
+            )
+            result = self._write_html_report(output_path, "IoC Report", body)
+            result.update({"total_ips": len(ips), "total_domains": len(domains)})
+            return result
+        except Exception as e:
+            return {"error": str(e)}
     
     def export_findings_json(self, output_path: str = "findings.json") -> Dict[str, Any]:
         """Export all findings as JSON file."""
